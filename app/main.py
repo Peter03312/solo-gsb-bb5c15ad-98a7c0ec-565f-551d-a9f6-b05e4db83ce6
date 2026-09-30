@@ -16,8 +16,16 @@
   被替换者对本次请求的同意立即失效、其他同意保留，有效票不足两票则请求
   退回待同意（waiting -> pending），新见证人可凭封存摘要补票；已到最早
   开封时刻且两票已齐的请求先开封并拒绝替换；已过截止时刻的请求按原规则失效；
+- 资料未开封时，封存人可向另一名本地账号发起交接邀请（受让人账号 + 带时区
+  确认截止时刻）：受让人须已注册、不是封存人本人或当前见证人；每份资料同时
+  只允许一份待确认且未过期邀请，逾期/撤回后可重新邀请；封存人可撤回未确认
+  邀请，受让人须在截止前凭自己的 X-API-Key 确认；
+- 交接确认先做“到点开封 + 请求到期”结算：资料已开封则拒绝交接；否则进行中
+  的开封请求及旧同意失效（请求置 superseded，新封存人可重新申请），再转移
+  封存人身份，见证名单/正文/摘要不变；原封存人随即失去查看与操作权限；
+  开封前任何响应（含全部拒绝路径）都不泄露正文；
 - 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
-  到期/替换见证人只有一个已提交结果；
+  到期/替换见证人/交接确认与撤回只有一个已提交结果；
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 """
 import asyncio
@@ -37,6 +45,8 @@ from .config import settings
 from .db import connect, init_db, now_utc, utc_str, write_tx
 from .schemas import (
     ApproveIn,
+    HandoverIn,
+    HandoverRevokeIn,
     OpenRequestIn,
     RegisterIn,
     ReplaceWitnessIn,
@@ -129,6 +139,85 @@ def resolve_due_waiting(tx: sqlite3.Connection, now: str, request_id: int | None
     return len(rows)
 
 
+def expire_due_open_requests(tx: sqlite3.Connection, now: str, doc_id: int) -> list[int]:
+    """在已持有的写事务内，把某资料已过截止时刻仍 pending 的开封请求确定性失效。
+
+    交接确认做“请求到期”结算时调用（与新建请求/替换见证人临界区内的顺手失效、
+    以及后台扫描器语义一致）。返回被置为 expired 的请求 id 列表，调用方据此
+    产生旧请求结果；对应的旧同意永久失效（保留在 approvals 中仅用于审计）。
+    """
+    rows = tx.execute(
+        "SELECT id FROM open_requests"
+        " WHERE document_id = ? AND status = 'pending' AND deadline <= ?",
+        (doc_id, now),
+    ).fetchall()
+    ids = [row["id"] for row in rows]
+    for req_id in ids:
+        tx.execute(
+            "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
+            (now, req_id),
+        )
+        add_audit(
+            tx,
+            actor_id=None,
+            action="request_expired",
+            document_id=doc_id,
+            request_id=req_id,
+            detail="交接确认时结算：开封请求已过截止时刻仍不足两票，请求失效，已有同意作废",
+        )
+    return ids
+
+
+def expire_due_handover_invitations(tx: sqlite3.Connection, now: str, doc_id: int | None = None) -> int:
+    """在已持有的写事务内把到截止时刻仍待确认的交接邀请确定性置为 expired。
+
+    与“到点开封”一样，后台扫描器与每个相关写临界区都会先调用本函数，使邀请
+    一到截止时刻即不可确认（即使后台扫描延迟），并释放“每份资料一份待确认
+    邀请”的名额，封存人可重新邀请。返回过期条数。
+    """
+    if doc_id is not None:
+        rows = tx.execute(
+            "SELECT id, document_id FROM handover_invitations"
+            " WHERE status = 'pending' AND deadline <= ? AND document_id = ?",
+            (now, doc_id),
+        ).fetchall()
+    else:
+        rows = tx.execute(
+            "SELECT id, document_id FROM handover_invitations"
+            " WHERE status = 'pending' AND deadline <= ?",
+            (now,),
+        ).fetchall()
+    for row in rows:
+        tx.execute(
+            "UPDATE handover_invitations SET status='expired', resolved_at=? WHERE id=?",
+            (now, row["id"]),
+        )
+        add_audit(
+            tx,
+            actor_id=None,
+            action="handover_expired",
+            document_id=row["document_id"],
+            detail=f"交接邀请 {row['id']} 过确认截止时刻未被受让人确认，邀请失效，可重新邀请",
+        )
+    return len(rows)
+
+
+def handover_payload(tx: sqlite3.Connection, inv: sqlite3.Row) -> dict[str, Any]:
+    """构造邀请状态（开封前也可返回：只含元数据，绝无正文/摘要）。"""
+    invitee = tx.execute("SELECT username FROM users WHERE id = ?", (inv["invitee_id"],)).fetchone()
+    inviter = tx.execute("SELECT username FROM users WHERE id = ?", (inv["inviter_id"],)).fetchone()
+    return {
+        "invitation_id": inv["id"],
+        "document_id": inv["document_id"],
+        "status": inv["status"],
+        "inviter": inviter["username"] if inviter else None,
+        "invitee": invitee["username"] if invitee else None,
+        "deadline": inv["deadline"],
+        "created_at": inv["created_at"],
+        "resolved_at": inv["resolved_at"],
+    }
+
+
 class ExpirySweeper:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
@@ -160,7 +249,8 @@ class ExpirySweeper:
     @staticmethod
     def sweep_once() -> int:
         """一轮定时处理：先把到点的 waiting 请求开封，再把过截止时刻仍
-        pending（票数不足）的请求置为 expired；返回失效（expired）条数。"""
+        pending（票数不足）的请求置为 expired；同时把过确认截止时刻仍
+        pending 的交接邀请置为 expired；返回失效（expired 开封请求）条数。"""
         conn = connect()
         try:
             with write_tx(conn) as tx:
@@ -187,6 +277,8 @@ class ExpirySweeper:
                         request_id=row["id"],
                         detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
                     )
+                # 第三步：到确认截止时刻仍未确认的交接邀请失效（可重新邀请）。
+                expire_due_handover_invitations(tx, now)
                 return len(rows)
         finally:
             conn.close()
@@ -206,7 +298,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -447,6 +539,14 @@ def get_document(
                     (latest["id"],),
                 ).fetchone()["c"],
             }
+
+    # 最新交接邀请只含元数据（双方账号/截止时刻/状态），开封前后都不泄露正文/摘要
+    inv = db.execute(
+        "SELECT * FROM handover_invitations WHERE document_id = ? ORDER BY id DESC LIMIT 1",
+        (doc_id,),
+    ).fetchone()
+    if inv is not None:
+        result["latest_handover"] = handover_payload(db, inv)
     return result
 
 
@@ -892,6 +992,303 @@ def replace_witness(
     if post_commit_error is not None:
         raise post_commit_error
     return result
+
+
+# ---------------------------------------------------------------------------
+# 封存人交接（资料未开封）
+#
+# 封存人可为未开封资料向另一名本地账号发起交接邀请：填写受让人账号与带时区
+# 的确认截止时刻。受让人须已注册、不是封存人本人、也不是当前见证人；每份
+# 资料同时只允许一份“待确认且未过期”的邀请，撤回或逾期后可重新邀请。
+# 封存人可撤回未确认邀请；受让人须在截止前凭自己的 X-API-Key 确认。
+#
+# 确认时先结算“到点开封 + 请求到期”：若资料因此（或此前）已开封则拒绝交接；
+# 否则进行中的开封请求（pending/waiting）置为 superseded、旧同意失效，再转移
+# 封存人身份；见证名单、正文、摘要均不变。交接后原封存人立即失去该资料的
+# 查看与操作权限（参与方校验即按新 owner 与当前见证人名单），新封存人可重新
+# 申请开封。全部判定在 BEGIN IMMEDIATE 临界区内完成，并发确认/撤回/同意/
+# 替换/定时处理只产生一个已提交结果；开封前任何响应都不泄露正文。
+# ---------------------------------------------------------------------------
+
+
+@app.post("/documents/{doc_id}/handovers", status_code=201)
+def create_handover(
+    doc_id: int,
+    payload: HandoverIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    doc = load_doc_for_participant(db, doc_id, user)
+    if doc["owner_id"] != user["id"]:
+        raise err(403, "只有封存人可以发起交接")
+
+    deadline = utc_str(payload.deadline)
+    now = utc_str(now_utc())
+    if deadline <= now:
+        raise err(400, "确认截止时刻必须晚于当前时间")
+
+    with write_tx(db) as tx:
+        # 与所有写临界区一致：先做确定性到点开封，再判定资料是否仍可交接。
+        resolve_due_waiting(tx, now)
+        # 到截止时刻仍待确认的旧邀请先确定性失效，释放“一份待确认邀请”名额。
+        expire_due_handover_invitations(tx, now, doc_id)
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc["status"] != "sealed":
+            raise err(409, "资料已开封，不能发起交接")
+
+        active = tx.execute(
+            "SELECT id FROM handover_invitations WHERE document_id = ? AND status = 'pending'",
+            (doc_id,),
+        ).fetchone()
+        if active is not None:
+            raise err(409, "该资料已有一份待确认且未过期的交接邀请")
+
+        if payload.invitee == user["username"]:
+            raise err(400, "受让人不能是封存人本人")
+        invitee = tx.execute(
+            "SELECT id, username FROM users WHERE username = ?",
+            (payload.invitee,),
+        ).fetchone()
+        if invitee is None:
+            raise err(400, "受让人尚未注册")
+        is_witness = tx.execute(
+            "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+            (doc_id, invitee["id"]),
+        ).fetchone()
+        if is_witness is not None:
+            raise err(400, "受让人不能是该资料的当前见证人")
+
+        cur = tx.execute(
+            "INSERT INTO handover_invitations"
+            " (document_id, inviter_id, invitee_id, deadline, status, created_at)"
+            " VALUES (?, ?, ?, ?, 'pending', ?)",
+            (doc_id, user["id"], invitee["id"], deadline, now),
+        )
+        invitation_id = cur.lastrowid
+        add_audit(
+            tx,
+            actor_id=user["id"],
+            action="handover_invited",
+            document_id=doc_id,
+            detail=f"封存人发起交接邀请：受让人 {payload.invitee}，确认截止时刻 {deadline}",
+        )
+        inv = tx.execute(
+            "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+        ).fetchone()
+        result = handover_payload(tx, inv)
+    return result
+
+
+@app.post("/handovers/{invitation_id}/revoke")
+def revoke_handover(
+    invitation_id: int,
+    payload: HandoverRevokeIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    inv = db.execute(
+        "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+    ).fetchone()
+    if inv is None or inv["inviter_id"] != user["id"]:
+        # 不区分邀请是否存在，避免向无权方泄露资料/邀请信息
+        raise err(403, "无权操作该邀请或邀请不存在")
+
+    now = utc_str(now_utc())
+    with write_tx(db) as tx:
+        # 到点开封与其它写路径一致先结算（虽不影响邀请，但保证全库时间判定唯一）。
+        resolve_due_waiting(tx, now)
+        expire_due_handover_invitations(tx, now, inv["document_id"])
+        cur = tx.execute(
+            "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+        ).fetchone()
+        if cur["status"] == "confirmed":
+            raise err(409, "交接已完成，邀请不能撤回")
+        if cur["status"] == "revoked":
+            raise err(409, "邀请已撤回，不能重复撤回")
+        if cur["status"] == "expired" or cur["deadline"] <= now:
+            raise err(409, "邀请已过确认截止时刻，不能撤回，可重新邀请")
+        tx.execute(
+            "UPDATE handover_invitations SET status='revoked', resolved_at=? WHERE id=?",
+            (now, invitation_id),
+        )
+        add_audit(
+            tx,
+            actor_id=user["id"],
+            action="handover_revoked",
+            document_id=cur["document_id"],
+            detail=f"封存人撤回交接邀请。原因: {payload.reason or '（未填写）'}",
+        )
+        cur = tx.execute(
+            "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+        ).fetchone()
+        result = handover_payload(tx, cur)
+    return result
+
+
+@app.post("/handovers/{invitation_id}/confirm")
+def confirm_handover(
+    invitation_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    inv = db.execute(
+        "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+    ).fetchone()
+    if inv is None or inv["invitee_id"] != user["id"]:
+        # 只有指定受让人可确认；对其它人一律按不存在处理，不泄露资料
+        raise err(403, "无权确认该邀请或邀请不存在")
+
+    now = utc_str(now_utc())
+    # 到点开封须先落库：若资料在本次结算中自动开封，开封不能被随后的拒绝回滚，
+    # 因此与同意/撤销/替换路径相同：错误延迟到事务提交后再抛出。
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 第一步：全库到点开封（确定性）。
+        due_opened = resolve_due_waiting(tx, now) > 0
+        doc_id = inv["document_id"]
+        # 第二步：本资料“请求到期”结算（过截止仍 pending 的请求失效）。
+        expired_req_ids = expire_due_open_requests(tx, now, doc_id)
+
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc["status"] != "sealed":
+            # 资料已开封即拒绝交接。若开封由本临界区的到点结算触发，必须先随本
+            # 事务提交，故错误延迟到提交后返回。
+            if due_opened:
+                post_commit_error = err(409, "资料已开封，交接被拒绝")
+            else:
+                raise err(409, "资料已开封，交接被拒绝")
+        else:
+            cur = tx.execute(
+                "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+            ).fetchone()
+            if cur["status"] == "confirmed":
+                raise err(409, "交接邀请已确认，不能重复确认")
+            if cur["status"] == "revoked":
+                raise err(409, "交接邀请已被封存人撤回，不能确认")
+            if cur["status"] == "expired" or cur["deadline"] <= now:
+                # 临界区内确定性失效（可能只是刚到点、后台扫描尚未处理）
+                tx.execute(
+                    "UPDATE handover_invitations SET status='expired', resolved_at=? WHERE id=?",
+                    (now, invitation_id),
+                )
+                add_audit(
+                    tx,
+                    actor_id=None,
+                    action="handover_expired",
+                    document_id=doc_id,
+                    detail="受让人确认时已过确认截止时刻，邀请确定性失效，可重新邀请",
+                )
+                raise err(409, "交接邀请已过确认截止时刻，不能确认，可重新邀请")
+            if cur["inviter_id"] != doc["owner_id"]:
+                # 发起后封存人身份已变更（理论上的异常态），邀请不再有效
+                raise err(409, "邀请的封存人身份已失效，不能确认")
+            if tx.execute(
+                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+                (doc_id, cur["invitee_id"]),
+            ).fetchone():
+                # 以当前名单复核：发起后受让人被加入见证名单则不能再成为封存人
+                raise err(409, "受让人现为该资料的当前见证人，不能确认交接")
+
+            # 使进行中的开封请求及旧同意失效（pending / waiting 均不再有效）。
+            # waiting 能走到这里说明未到最早开封时刻，否则上面的到点结算已开封。
+            old_req: dict[str, Any] | None = None
+            if expired_req_ids:
+                # 到期结算刚失效的请求（approval_count 归零：旧同意永久失效）
+                old_req = {
+                    "request_id": expired_req_ids[-1],
+                    "status": "expired",
+                    "approval_count": 0,
+                }
+            active_req = tx.execute(
+                "SELECT * FROM open_requests"
+                " WHERE document_id = ? AND status IN ('pending', 'waiting')"
+                " ORDER BY id DESC LIMIT 1",
+                (doc_id,),
+            ).fetchone()
+            if active_req is not None:
+                tx.execute(
+                    "UPDATE open_requests SET status='superseded', resolved_at=? WHERE id=?",
+                    (now, active_req["id"]),
+                )
+                add_audit(
+                    tx,
+                    actor_id=user["id"],
+                    action="request_superseded",
+                    document_id=doc_id,
+                    request_id=active_req["id"],
+                    detail="交接确认：进行中的开封请求及旧同意失效，新封存人可重新申请开封",
+                )
+                old_req = {
+                    "request_id": active_req["id"],
+                    "status": "superseded",
+                    "approval_count": 0,
+                }
+
+            # 转移封存人身份：owner 变更；见证名单、正文、摘要不变。
+            old_owner_id = doc["owner_id"]
+            tx.execute(
+                "UPDATE documents SET owner_id=? WHERE id=? AND status='sealed'",
+                (cur["invitee_id"], doc_id),
+            )
+            tx.execute(
+                "UPDATE handover_invitations SET status='confirmed', resolved_at=? WHERE id=?",
+                (now, invitation_id),
+            )
+            old_name = tx.execute(
+                "SELECT username FROM users WHERE id = ?", (old_owner_id,)
+            ).fetchone()["username"]
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="handover_confirmed",
+                document_id=doc_id,
+                detail=(
+                    f"受让人确认交接，封存人由 {old_name} 变更为 {user['username']}；"
+                    "见证名单、正文、摘要不变，原封存人即时失去查看与操作权限"
+                ),
+            )
+
+            new_owner = tx.execute(
+                "SELECT username FROM users WHERE id = ?", (cur["invitee_id"],)
+            ).fetchone()
+            final_inv = tx.execute(
+                "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+            ).fetchone()
+            result = {
+                "invitation": handover_payload(tx, final_inv),
+                "current_owner": new_owner["username"],
+                "old_open_request": old_req,
+            }
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+@app.get("/me/handovers")
+def list_my_handovers(
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """与当前账号相关的交接邀请：本人发起（inviter）或本人为受让人（invitee）。
+
+    只返回邀请元数据，不含正文/摘要；受让人据此取得待确认邀请及其截止时刻。
+    """
+    rows = db.execute(
+        """SELECT i.*,
+                  CASE WHEN i.inviter_id = ? THEN 'inviter' ELSE 'invitee' END AS role
+           FROM handover_invitations i
+           WHERE i.inviter_id = ? OR i.invitee_id = ?
+           ORDER BY i.id DESC""",
+        (user["id"], user["id"], user["id"]),
+    ).fetchall()
+    items = []
+    for row in rows:
+        item = handover_payload(db, row)
+        item["role"] = row["role"]
+        items.append(item)
+    return {"invitations": items}
 
 
 # ---------------------------------------------------------------------------

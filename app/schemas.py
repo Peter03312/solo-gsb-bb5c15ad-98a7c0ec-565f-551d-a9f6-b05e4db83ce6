@@ -46,3 +46,23 @@ class ReplaceWitnessIn(BaseModel):
 
 class RevokeIn(BaseModel):
     reason: str = Field(default="", max_length=2000)
+
+
+class HandoverIn(BaseModel):
+    """封存人为未开封资料向另一名本地账号发起交接邀请。"""
+
+    invitee: str = Field(min_length=1, max_length=64)
+    deadline: datetime  # 受让人确认截止时刻，必须带时区且晚于当前时间
+
+    @field_validator("deadline")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("时间字段必须带时区信息，例如 2026-10-01T12:00:00Z")
+        return v
+
+
+class HandoverRevokeIn(BaseModel):
+    """封存人撤回尚未确认的交接邀请。"""
+
+    reason: str = Field(default="", max_length=2000)
