@@ -4,7 +4,8 @@
 开封必须由封存人发起请求（理由 + 截止时刻，可选**最早开封时刻**），并在截止前取得
 **两名不同指定见证人**分别同意；同意必须绑定本次请求与封存时的摘要。
 资料未开封时，封存人可在见证人无法履职后**替换指定见证人**，新见证人可继续为
-进行中的开封请求补票。技术栈：Python 3.11 + FastAPI + SQLite。
+进行中的开封请求补票；封存人也可就未开封资料向另一名本地账号**发起交接邀请**，
+受让人在截止前确认后成为新封存人。技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
 
@@ -23,9 +24,13 @@
 | 未开封可替换见证人 | 封存人在资料未开封时可把一名指定见证人换为新人：新人须已注册、非封存人、不在当前名单，替换后仍为三名不同见证人；旧见证人随即失去访问与同意权限 |
 | 替换不破坏进行中请求 | 被替换者对本次请求的同意立即失效、其他同意保留；有效票不足两票时请求由 `waiting` 退回 `pending`，新见证人凭封存摘要补票；已到最早开封时刻且两票已齐则先开封并拒绝替换；过截止时刻的请求按原规则失效后再完成替换 |
 | 撤销/到期作废 | 到点**之前**封存人可撤销；过截止时刻始终不足两票则置为 `revoked`/`expired`，其同意永久失效；新请求从 0 票开始 |
+| 未开封可交接封存人 | 封存人可就未开封资料向另一已注册本地账号发起交接邀请（受让人不能是本人或当前见证人），填写带时区确认截止时刻；每份资料同时至多一份待确认且未过期邀请；封存人可撤回；受让人须在截止前凭本人密钥确认 |
+| 交接确认结算顺序 | 确认临界区先做确定性到点开封与开封请求到期判定：资料若已开封则拒绝交接；否则进行中的开封请求置 `invalidated`（过截止时刻的按原规则置 `expired`）并删除全部旧同意，再转移封存人身份；见证名单、正文、摘要不变 |
+| 交接后权限 | 原封存人立即失去该资料的查看/操作权限（统一 403，不区分资料是否存在）；新封存人可重新申请开封，新请求从 0 票开始；开封前任何接口与错误体都不含正文 |
+| 邀请生命周期 | `pending` 邀请可撤回（`revoked`）或逾期（`expired`，后台扫描与每个交接写事务都会确定性判定）；已撤回/逾期/资料开封后均不可确认；撤回或逾期后封存人可重新邀请；资料开封会连带使待确认邀请失效 |
 | 拒绝且状态不变 | 失效凭据(401)、非见证人(403)、无效时限(400/422)、重复开封(409) 等任何拒绝路径都不写数据（到点自动开封的提交除外：开封先落库，拒绝在提交后返回） |
-| 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成；并发同意/撤销/定时开封/到期/替换见证人只有一个已提交终态（同意在锁内以“当前名单”复核见证人身份） |
-| 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
+| 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成；并发同意/撤销/定时开封/到期/替换见证人/交接发起、撤回、确认只有一个已提交终态（同意在锁内以“当前名单”复核见证人身份；交接与第二票同意赛跑时要么开封要么交接，互斥且唯一） |
+| 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`（含 `handover_invited/confirmed/revoked/expired`、`request_invalidated`）；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
 
 ### 请求状态机
 
@@ -36,15 +41,17 @@ waiting  ──(到达 earliest_open_at；扫描器或任意写事务触发)─�
 waiting  ──(封存人替换投票见证人，有效票不足两票)───────────▶ pending（新见证人补票）
 pending  ──(封存人在截止前撤销)─────────────────────────────▶ revoked
 pending  ──(过 deadline 仍不足两票)─────────────────────────▶ expired
+pending/waiting ──(受让人在交接邀请截止前确认交接)──────────▶ invalidated（旧同意删除）
 ```
 
 > 替换见证人不改变资料的 `sealed` 状态，只改变当前见证人名单，并按上表调整
-> 进行中请求的票数与状态；`sealed/opened` 是资料生命周期，`pending/waiting`
-> 等是开封请求的状态，两者互不混淆。
+> 进行中请求的票数与状态；交接封存人也不改变资料状态，只把进行中的开封请求
+> 置为 `invalidated`（过截止时刻的仍为 `expired`）并转移封存人；`sealed/opened`
+> 是资料生命周期，`pending/waiting` 等是开封请求的状态，两者互不混淆。
 
 后台扫描器（默认每秒一次）在一轮内先把到点的 `waiting` 请求确定性开封，
-再把已到截止时刻仍 `pending` 的请求置为 `expired`；
-所有涉时刻判定在写事务内再做一次，杜绝临界时间竞态。
+再把已到截止时刻仍 `pending` 的请求置为 `expired`，最后把过确认截止时刻仍
+`pending` 的交接邀请置为 `expired`；所有涉时刻判定在写事务内再做一次，杜绝临界时间竞态。
 
 ## 一键启动（Docker Compose）
 
@@ -100,14 +107,21 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/open-requests/{id}/approve` | 见证人同意：`{digest}`（须等于封存摘要）；第二票可能返回 `waiting` 或 `opened` |
 | POST | `/open-requests/{id}/revoke` | 封存人撤销：`{reason?}` |
 | POST | `/documents/{id}/witness-replacements` | 封存人替换一名指定见证人（资料未开封）：`{old_witness, new_witness}` |
+| POST | `/documents/{id}/handover-invitations` | 封存人就未开封资料发起交接邀请：`{to_username, confirm_deadline}` |
+| POST | `/handover-invitations/{id}/confirm` | 受让人在截止前凭本人密钥确认；返回新封存人与旧请求结果 |
+| POST | `/handover-invitations/{id}/revoke` | 封存人撤回待确认邀请 |
+| GET | `/handover-invitations/{id}` | 查询邀请状态（邀请双方或资料参与方可见，仅元数据） |
 | GET | `/documents/{id}/audit` | 按顺序返回该资料的全部操作记录 |
 
 状态码：成功 `200/201`；参数校验失败 `422`（如时间不带时区、`earliest_open_at`
 不早于 `deadline`）；业务校验失败 `400`（如三人不互异、截止时刻已过、最早开封时刻
-早于当前、替换时新见证人未注册或为封存人）；未认证 `401`；无权/不可见 `403`
-（含被替换掉的旧见证人再访问/再同意）；未找到 `404`（被替换者不在当前名单）；
+早于当前、替换时新见证人未注册或为封存人、交接受让人未注册/为本人/为见证人、
+确认截止时刻已过）；未认证 `401`；无权/不可见 `403`
+（含被替换掉的旧见证人再访问/再同意、交接后原封存人再访问、非受让人确认、
+非封存人撤回）；未找到 `404`（被替换者不在当前名单）；
 冲突（重复同意、重复开封、请求已撤销/到期、waiting 下再同意、已有进行中请求、
-新见证人已在名单、资料已开封仍替换等）`409`。错误体统一为
+新见证人已在名单、资料已开封仍替换、重复发起待确认交接邀请、确认已撤回/逾期/
+已确认的邀请、交接时资料已开封等）`409`。错误体统一为
 `{"detail": "..."}`，不含任何正文内容。
 
 ### 最早开封时刻（earliest_open_at）
@@ -212,6 +226,88 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST $BASE/open-requests/7/approve 
 #   被替换者不在当前名单 404；非封存人调用 403；资料已开封 409。
 ```
 
+### 封存人交接（handover）
+
+资料**未开封**时，封存人可向另一名本地账号发起交接邀请，受让人在确认截止前
+凭本人密钥确认后成为新封存人。
+
+- `POST /documents/{id}/handover-invitations`，请求体
+  `{"to_username": "<受让人用户名>", "confirm_deadline": "<带时区 ISO-8601 时刻>"}`。
+- 受让人必须**已注册**、**不是封存人本人**、且**不在当前见证人名单中**；
+  `confirm_deadline` 必须带时区且晚于当前时间。邀请待确认期间，封存人也不能
+  把受让人替换进见证人名单（`409`），保证确认后不会出现“新封存人兼见证人”。
+- 每份资料同时**至多一份**待确认（`pending`）且未过期的邀请：重复发起 `409`；
+  先撤回或等其逾期后可重新邀请。只有**封存人本人**可发起与撤回。
+- 封存人可 `POST /handover-invitations/{id}/revoke` 撤回待确认邀请；
+  受让人可 `POST /handover-invitations/{id}/confirm` 在截止前确认；
+  `GET /handover-invitations/{id}` 查询状态（邀请双方或该资料当前参与方可见，仅元数据）。
+- **已撤回、已逾期、已确认的邀请不能确认**；资料在邀请期间开封的，邀请连带
+  失效（`expired`），同样不能确认。逾期判定既由后台扫描器执行，也在每个交接
+  写事务内确定性再做一次，不依赖扫描及时性。
+- 确认在同一写临界区内按顺序结算：
+  1. 确定性处理到点开封与开封请求到期；
+  2. 资料若**已开封**（含临界区内刚触发的到点开封）则拒绝交接（`409`），身份不变；
+  3. 否则把进行中的开封请求置为 `invalidated`（若其已过截止时刻则按原规则
+     `expired`），并**删除其全部旧同意**（旧同意永久失效，不能用于后续请求）；
+  4. 转移封存人身份；**见证名单、正文、摘要均不变**。
+- 交接成功响应（`200`）在邀请状态之外还返回：
+
+  ```json
+  {
+    "invitation_id": 4,
+    "status": "confirmed",
+    "from_username": "alice",
+    "to_username": "erin",
+    "document_id": 2,
+    "document_status": "sealed",
+    "current_owner": "erin",
+    "previous_owner": "alice",
+    "witnesses": ["bob", "carol", "dave"],
+    "old_open_request": {"request_id": 7, "status": "invalidated", "approval_count": 0}
+  }
+  ```
+
+  `old_open_request` 为 `null` 表示无进行中开封请求；否则给出旧请求 `request_id`、
+  终态（`invalidated`/`expired`）与清零后的票数。响应不含正文 `body`。
+- 交接后**原封存人立即失去**该资料的查看/列表/审计与一切操作权限（统一 `403`，
+  不区分资料是否存在）；**新封存人可重新申请开封**，从 0 票开始，由同三名
+  见证人重新两票同意。见证人名单与权限不变。
+- 成功操作返回邀请状态；每次成功发起/撤回/确认/逾期、旧请求失效与成功交接均
+  追加审计（`handover_invited`、`handover_revoked`、`handover_confirmed`、
+  `handover_invitation_expired`、`request_invalidated`、`request_expired`）。
+
+```bash
+# 发起交接邀请（确认截止时刻取 1 小时后，支持 +08:00 等带时区写法）
+DEADLINE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).isoformat())")
+curl -sS -X POST $BASE/documents/1/handover-invitations \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"to_username\":\"erin\",\"confirm_deadline\":\"$DEADLINE\"}"
+# -> {"invitation_id":1,"status":"pending","to_username":"erin",...}
+
+# 受让人 erin 凭本人 X-API-Key 在截止前确认
+curl -sS -X POST $BASE/handover-invitations/1/confirm -H "X-API-Key: $ERIN_KEY"
+# -> {"status":"confirmed","current_owner":"erin","previous_owner":"alice",
+#     "witnesses":["bob","carol","dave"],
+#     "old_open_request":{"request_id":7,"status":"invalidated","approval_count":0}}
+
+# 原封存人随即无权访问；新封存人可重新申请开封
+curl -sS -o /dev/null -w '%{http_code}\n' $BASE/documents/1 -H "X-API-Key: $OWNER_KEY"
+# -> 403
+curl -sS -X POST $BASE/documents/1/open-requests \
+  -H "X-API-Key: $ERIN_KEY" -H 'Content-Type: application/json' \
+  -d "{\"reason\":\"新封存人申请\",\"deadline\":\"$DEADLINE\"}"
+# -> 201，新请求 approval_count 从 0 开始
+
+# 撤回待确认邀请（封存人）；撤回/逾期后均返回 409 不能确认，可重新邀请
+curl -sS -X POST $BASE/handover-invitations/1/revoke -H "X-API-Key: $OWNER_KEY"
+# -> {"invitation_id":1,"status":"revoked",...}
+
+# 拒绝示例（均不改状态、不转移身份、不泄露正文）：
+#   受让人未注册/为本人/为见证人 400；确认截止时刻已过 400；时间不带时区 422；
+#   非封存人发起/撤回 403；非受让人确认 403；无/错密钥 401；
+#   重复发起待确认邀请 409；确认已撤回/逾期/已确认邀请 409；资料已开封 409。
+```
+
 ### 调用示例（curl）
 
 ```bash
@@ -264,6 +360,7 @@ bash examples/demo.sh                    # curl 版（未设最早开封时刻�
 python3 examples/demo.py                 # 纯标准库 Python 版
 python3 examples/demo_scheduled.py       # 最早开封时刻：waiting -> 自动开封；补票立即开封
 python3 examples/demo_replace_witness.py # 见证人替换：直接换人 / 退票补票 / waiting 退回待同意
+python3 examples/demo_handover.py        # 封存人交接：邀请/撤回/逾期/确认失效旧请求/转移身份/开封后邀请失效
 ```
 
 ### 典型拒绝场景
@@ -292,7 +389,14 @@ python -m pytest -q
 其他同意保留）、新见证人凭摘要补票开封、`waiting` 替换投票者退回 `pending`
 （替换未投票者维持 `waiting`）、到点两票已齐先开封并拒绝替换、过截止请求先
 按原规则失效再换人、替换后冷读库重启一致，以及**并发替换 vs 第二票同意赛跑**
-（验证锁内以当前名单复核身份、只产生一个终态）。
+（验证锁内以当前名单复核身份、只产生一个终态）；
+再含封存人交接：发起校验（受让人已注册/非本人/非见证人、截止时刻带时区且在未来）、
+每份资料唯一待确认邀请、撤回与重新邀请、逾期不能确认且可重新邀请、确认转移身份
+（原封存人随即 403、见证人名单/正文/摘要不变）、旧开封请求 `invalidated` 与旧同意
+清零、过截止旧请求按原规则 `expired`、`waiting` 请求随交接失效且不开封、到点两票
+已齐先开封并拒绝交接、资料开封连带邀请失效、交接结果冷读库一致，以及真实 uvicorn +
+多线程的**并发确认 vs 撤回、并发确认 vs 第二票同意赛跑**（两种终态互斥且唯一，
+成功交接与请求失效均留审计）。
 
 ## 项目结构
 
@@ -300,12 +404,12 @@ python -m pytest -q
 app/
   config.py     # 环境变量配置
   db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
-  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人入参校验）
-  main.py       # FastAPI 路由、认证、定时开封+到期扫描器、全部业务规则（含见证人替换）
+  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请入参校验）
+  main.py       # FastAPI 路由、认证、定时开封+到期扫描器、全部业务规则（见证人替换、封存人交接）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py 端到端示例
+tests/          # pytest 测试（功能、定时、替换见证人、交接、并发、重启）
 Dockerfile
 docker-compose.yml
 ```
